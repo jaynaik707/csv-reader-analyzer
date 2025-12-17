@@ -1,0 +1,241 @@
+"""
+Kafka Producer for E-Commerce Orders
+Reads CSV file and streams records to Kafka topic
+"""
+
+import pandas as pd
+from kafka import KafkaProducer
+import json
+import time
+from datetime import datetime
+from typing import Optional
+
+
+class KafkaOrderProducer:
+    """
+    Producer class for streaming orders from CSV to Kafka
+    """
+    
+    def __init__(self, bootstrap_servers: str, topic: str, csv_path: str, delay: float = 0.1, 
+                 use_ssl: bool = False, ssl_config: Optional[dict] = None):
+        """
+        Initialize the Kafka producer
+        
+        Args:
+            bootstrap_servers: Kafka bootstrap servers
+            topic: Kafka topic name
+            csv_path: Path to CSV file
+            delay: Delay between messages (seconds)
+            use_ssl: Whether to use SSL/TLS connection (for production)
+            ssl_config: SSL configuration dict (optional)
+        """
+        self.bootstrap_servers = bootstrap_servers
+        self.topic = topic
+        self.csv_path = csv_path
+        self.delay = delay
+        self.use_ssl = use_ssl
+        self.ssl_config = ssl_config or {}
+        self.producer = None  # Created in __enter__
+        self.stats = {'sent': 0, 'failed': 0}
+    
+    def __enter__(self):
+        """
+        Context manager entry point - sets up Kafka producer
+        Called automatically when entering 'with' block
+        """
+        print("Initializing Kafka producer...")
+        self.producer = self._create_producer()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit point - ensures cleanup
+        Called automatically when exiting 'with' block, even on errors
+        
+        Args:
+            exc_type: Exception type if error occurred, None otherwise
+            exc_val: Exception value if error occurred
+            exc_tb: Exception traceback if error occurred
+        
+        Returns:
+            False to re-raise any exception (normal behavior)
+        """
+        if exc_type is not None:
+            print(f"\nError occurred during execution: {exc_type.__name__}")
+        
+        self.close()
+        return False  # Don't suppress exceptions
+    
+    def _create_producer(self) -> KafkaProducer:
+        """
+        Create and return Kafka producer instance with SSL support
+        
+        Returns:
+            Configured KafkaProducer instance
+        """
+        config = {
+            'bootstrap_servers': self.bootstrap_servers,
+            'value_serializer': lambda v: json.dumps(v, default=str).encode('utf-8'),
+            'acks': 'all',  # Wait for all replicas to acknowledge
+            'retries': 3,
+            'max_in_flight_requests_per_connection': 1
+        }
+        
+        # Add SSL configuration if enabled (for production)
+        if self.use_ssl:
+            config.update({
+                'security_protocol': 'SSL',
+                **self.ssl_config
+            })
+            print("SSL/TLS enabled for Kafka connection")
+        
+        return KafkaProducer(**config)
+    
+    def _read_orders(self) -> pd.DataFrame:
+        """
+        Read orders from CSV file
+        
+        Returns:
+            DataFrame containing order data
+        """
+        try:
+            df = pd.read_csv(self.csv_path)
+            print(f"Loaded {len(df)} orders from {self.csv_path}")
+            return df
+        except FileNotFoundError:
+            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
+        except Exception as e:
+            raise Exception(f"Error reading CSV: {e}")
+    
+    def _add_metadata(self, order_dict: dict) -> dict:
+        """
+        Add metadata to order (ingestion timestamp)
+        
+        Args:
+            order_dict: Original order data
+            
+        Returns:
+            Order data with added metadata
+        """
+        order_dict['ingestion_time'] = datetime.now().isoformat()
+        return order_dict
+    
+    def send_order(self, order_dict: dict) -> bool:
+        """
+        Send a single order to Kafka
+        
+        Args:
+            order_dict: Order data as dictionary
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Add ingestion timestamp
+            order_with_metadata = self._add_metadata(order_dict)
+            
+            # Send to Kafka
+            future = self.producer.send(self.topic, value=order_with_metadata)
+            
+            # Wait for send to complete (optional, for reliability)
+            future.get(timeout=10)
+            
+            self.stats['sent'] += 1
+            print(f"✓ Sent order {order_dict.get('order_id', 'unknown')}")
+            return True
+            
+        except Exception as e:
+            self.stats['failed'] += 1
+            print(f"✗ Failed to send order {order_dict.get('order_id', 'unknown')}: {e}")
+            return False
+    
+    def run(self, loop_continuously: bool = False):
+        """
+        Main execution loop - read CSV and stream to Kafka
+        
+        Args:
+            loop_continuously: If True, loop through CSV indefinitely
+        """
+        if self.producer is None:
+            raise RuntimeError("Producer not initialized. Use 'with' statement.")
+        
+        iteration = 0
+        
+        while True:
+            iteration += 1
+            if loop_continuously:
+                print(f"\n--- Iteration {iteration} ---")
+            
+            # Read orders from CSV
+            df = self._read_orders()
+            
+            # Send each order to Kafka
+            for idx, row in df.iterrows():
+                order_dict = row.to_dict()
+                self.send_order(order_dict)
+                time.sleep(self.delay)  # Simulate streaming
+            
+            # Exit if not looping
+            if not loop_continuously:
+                break
+            
+            print(f"Completed iteration {iteration}, restarting...")
+            time.sleep(1)  # Brief pause before next iteration
+    
+    def get_stats(self) -> dict:
+        """Return statistics about messages sent"""
+        return self.stats
+    
+    def close(self):
+        """Close the producer gracefully"""
+        if self.producer:
+            self.producer.flush()
+            self.producer.close()
+            print("Producer closed successfully")
+
+
+def main():
+    """
+    Entry point for the producer - uses context manager for automatic cleanup
+    """
+    from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, CSV_FILE_PATH, DELAY_SECONDS
+    
+    print("Starting Kafka Order Producer...")
+    print(f"Bootstrap servers: {KAFKA_BOOTSTRAP_SERVERS}")
+    print(f"Topic: {KAFKA_TOPIC}")
+    print(f"CSV file: {CSV_FILE_PATH}")
+    print("-" * 50)
+    
+    try:
+        # Use context manager - automatic resource management
+        with KafkaOrderProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            topic=KAFKA_TOPIC,
+            csv_path=CSV_FILE_PATH,
+            delay=DELAY_SECONDS,
+            use_ssl=False  # Set to True for production with SSL
+        ) as producer:
+            # Run the producer
+            producer.run(loop_continuously=False)
+            
+            # Print statistics
+            stats = producer.get_stats()
+            print("-" * 50)
+            print(f"Statistics:")
+            print(f"  Messages sent: {stats['sent']}")
+            print(f"  Messages failed: {stats['failed']}")
+        
+        # Producer automatically closed here via __exit__
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("Producer finished!")
+
+
+if __name__ == "__main__":
+    main()
